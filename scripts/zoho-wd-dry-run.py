@@ -116,8 +116,14 @@ def main():
         if not os.environ.get(key):
             fail(f"{key} is not exported in this terminal. Do not paste its value here.")
 
-    root_input = input("Local directory to compare [~/NK/Docs]: ").strip()
-    local_root = Path(root_input or "~/NK/Docs").expanduser().resolve()
+    config_path = Path(__file__).resolve().parent.parent / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        default_root = Path(config["localDir"]).expanduser() / "Docs"
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        fail("Set localDir in config.json before running this dry-run.")
+    root_input = input(f"Local directory to compare [{default_root}]: ").strip()
+    local_root = Path(root_input).expanduser().resolve() if root_input else default_root.resolve()
     if not local_root.is_dir():
         fail("Local directory is unavailable.")
 

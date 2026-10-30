@@ -115,8 +115,14 @@ def list_remote(api_root, token, root_id):
 
 
 def main():
-    source_text = input("Local directory [~/NK/Docs]: ").strip() or "~/NK/Docs"
-    source = Path(source_text).expanduser().resolve()
+    config_path = Path(__file__).resolve().parent.parent / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        default_source = Path(config["localDir"]).expanduser() / "Docs"
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        fail("Set localDir in config.json before running this dry-run.")
+    source_text = input(f"Local directory [{default_source}]: ").strip()
+    source = Path(source_text).expanduser().resolve() if source_text else default_source.resolve()
     if not source.is_dir():
         fail("Local directory is unavailable.")
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Incremental Zoho WorkDrive uploader. Dry-run by default; --apply uploads.
+"""Incremental Zoho WorkDrive uploader. Uploads by default; --dry-run previews without changes.
 
 Local scanning reads directory entries and metadata. File contents are opened only
 for files selected for upload. Deletion is opt-in and moves only manifest-tracked
@@ -8,11 +8,13 @@ files missing locally to WorkDrive Trash.
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from zoho_auth import get_access_token
@@ -20,26 +22,58 @@ from manifest_store import MANIFEST, read_manifest, source_key_for, write_manife
 
 PAGE_SIZE = 50
 MAX_NORMAL_UPLOAD = 250_000_000
-# All configured source directories. The manifest skips known unchanged files.
-BACKUP_SOURCE_DIRS = (
-    "Audio",
-    "Docs",
-    "eBooks",
-    "G2",
-    "Linux",
-    "Media",
-    "Music/Me",
-    "Music/My Collection",
-    "Music/Smule",
-    "temp",
-    "The Notebook of Thoughts, Arguments, and Papers",
-    "Video editing/Thumbnails, pictures and more",
-    "Worksheets",
-)
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+SOURCE_DIRS_FILE = PROJECT_DIR / "backup-dirs.txt"
+ASCII_ART_FILE = PROJECT_DIR / "assets" / "ascii-art-patorjk-com-favourites.txt"
+
+
+class Tee:
+    def __init__(self, terminal, logfile):
+        self.terminal = terminal
+        self.logfile = logfile
+
+    def write(self, value):
+        self.terminal.write(value)
+        plain_value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+        self.logfile.write(plain_value)
+        self.flush()
+        return len(value)
+
+    def flush(self):
+        self.terminal.flush()
+        self.logfile.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
+
+
+def setup_logging():
+    log_dir = Path(__file__).resolve().parents[1] / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    log_path = log_dir / f"zoho-wd-api-sync-{stamp}-{os.getpid()}.log"
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    logfile = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
+    sys.stdout = Tee(sys.stdout, logfile)
+    sys.stderr = Tee(sys.stderr, logfile)
+    return log_path
+
+
+def print_banner():
+    banner = f"\n{ASCII_ART_FILE.read_text(encoding='utf-8').rstrip()}\n"
+    terminal = getattr(sys.stdout, "terminal", sys.stdout)
+    terminal.write(banner)
+    terminal.flush()
+
+
+def color(text, code):
+    if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
+        return f"\033[{code}m{text}\033[0m"
+    return text
 
 
 def fail(message):
-    print(f"ERROR: {message}", file=sys.stderr)
+    print(color(f"ERROR: {message}", "31;1"), file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -231,10 +265,14 @@ def tracked_deletion_candidates(previous, local_files, remote_files):
     return candidates, conflicts
 
 
+def print_stat_line(label, value):
+    print(f"  {color(label + ':', '35')} {color(str(value), '37')}")
+
+
 def print_upload_stats(uploaded_bytes, elapsed):
     speed = uploaded_bytes / elapsed if elapsed > 0 else 0
-    print(f"Upload time: {elapsed:.2f}s")
-    print(f"Upload throughput: {human_bytes(speed)}/s")
+    print_stat_line("Upload time", f"{elapsed:.2f}s")
+    print_stat_line("Upload throughput", f"{human_bytes(speed)}/s")
 
 
 def upload_file(api_root, token, parent_id, path, filename):
@@ -276,7 +314,7 @@ def upload_file(api_root, token, parent_id, path, filename):
             if result.returncode != 6 or attempt == 5:
                 break
             delay = min(2 ** attempt, 30)
-            print(f"DNS lookup failed; retrying upload in {delay}s ({attempt}/4).")
+            print(color(f"DNS lookup failed; retrying upload in {delay}s ({attempt}/4).", "33"))
             time.sleep(delay)
     output = result.stdout.decode("utf-8", "replace")
     marker = "\n__HTTP_STATUS__:"
@@ -292,38 +330,194 @@ def upload_file(api_root, token, parent_id, path, filename):
         fail("Upload returned success HTTP status but invalid JSON; manifest not updated.")
     if response.get("errors") or response.get("status") == "failure":
         fail("WorkDrive reported an upload error; manifest not updated.")
+    response["_http_status"] = status_text.strip()
+    return response
 
 
-def project_env_value(key):
-    env_path = Path(__file__).resolve().parents[1] / ".env"
-    if not env_path.is_file():
-        return None
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        name, _, value = stripped.partition("=")
-        if name.strip() == key:
-            return value.strip().strip("\"'")
-    return None
+def upload_response_summary(response):
+    data = response.get("data")
+    if isinstance(data, list):
+        data = data[0] if data else None
+    attrs = data.get("attributes", {}) if isinstance(data, dict) else {}
+    if not isinstance(attrs, dict):
+        attrs = {}
+    summary = {"http_status": response.get("_http_status")}
+    for key in ("name", "size", "size_in_bytes", "storage_info", "status"):
+        if key in attrs:
+            summary[key] = attrs[key]
+    if response.get("status") is not None:
+        summary["api_status"] = response["status"]
+    if isinstance(data, dict) and data.get("id") is not None:
+        summary["id"] = data["id"]
+    return summary
+
+
+def safe_url_label(url):
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def http_error_context(exc, requested_url):
+    body = exc.read(8192)
+    details = {}
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("error", "code", "message", "description", "error_description", "status"):
+            value = payload.get(key)
+            if isinstance(value, (str, int, float)):
+                value = str(value)
+                value = re.sub(
+                    r"(?i)(access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|grant[_ -]?code)\s*[:=]\s*[^,\s\"']+",
+                    r"\1=<redacted>", value,
+                )
+                value = re.sub(r"(?i)Zoho-oauthtoken\s+\S+", "Zoho-oauthtoken <redacted>", value)
+                details[key] = value[:300]
+    result = (
+        f"HTTP {exc.code}; requested {safe_url_label(requested_url)}; "
+        f"responded from {safe_url_label(exc.geturl())}"
+    )
+    if details:
+        result += f"; response details: {json.dumps(details, sort_keys=True)}"
+    else:
+        result += f"; response body omitted ({len(body)} bytes, non-JSON or no recognized fields)"
+    auth_challenge = exc.headers.get("WWW-Authenticate") if exc.headers else None
+    if auth_challenge:
+        result += f"; WWW-Authenticate: {auth_challenge[:300]}"
+    return result
+
+
+def download_size_for_verification(api_root, token, file_id, expected_size):
+    if expected_size >= MAX_NORMAL_UPLOAD:
+        fail("Cannot download-verify a mismatched file at or above the 250 MB limit.")
+    api_parts = urlsplit(api_root)
+    host = api_parts.netloc
+    if host.startswith("www.zohoapis."):
+        download_host = host.replace("www.zohoapis.", "download.zoho.", 1)
+    else:
+        fail("Cannot determine the WorkDrive download host for this API region.")
+    path = f"/v1/workdrive/download/{quote(str(file_id), safe='')}"
+    url = urlunsplit((api_parts.scheme, download_host, path, "", ""))
+    request = Request(url, headers={"Authorization": f"Zoho-oauthtoken {token}"})
+    try:
+        with urlopen(request, timeout=90) as response:
+            total = 0
+            limit = expected_size + 1
+            while total < limit:
+                chunk = response.read(min(64 * 1024, limit - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+            return total
+    except HTTPError as exc:
+        fail(f"WorkDrive download verification failed: {http_error_context(exc, url)}")
+    except URLError as exc:
+        fail(f"WorkDrive download verification failed: {exc.reason}")
+
+
+def load_backup_source_dirs():
+    try:
+        lines = SOURCE_DIRS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        fail(f"Could not read source directory list: {SOURCE_DIRS_FILE}")
+    directories = [
+        line.strip() for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not directories:
+        fail(f"Source directory list is empty: {SOURCE_DIRS_FILE}")
+    for directory in directories:
+        path = Path(directory)
+        if path.is_absolute() or ".." in path.parts:
+            fail("Source directory entries must be relative paths without '..'.")
+    return directories
+
+
+def project_config():
+    config_path = Path(__file__).resolve().parent.parent / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        fail(f"Could not read project configuration: {config_path}")
+    if not isinstance(config, dict):
+        fail("Project configuration must be a JSON object.")
+    return config
+
+
+def local_backup_root(config):
+    value = config.get("localDir")
+    if not isinstance(value, str) or not value.strip():
+        fail("Set localDir in config.json to the NK backup root.")
+    root = Path(value).expanduser().resolve()
+    if not root.is_dir():
+        fail("Configured local backup root is unavailable.")
+    return root
+
+
+def print_source_sizes(sources):
+    sizes = []
+    for relative_root, source in sources:
+        result = subprocess.run(
+            ["du", "-s", "--bytes", "--", str(source)],
+            check=False, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            fail(f"Could not calculate source directory size: {relative_root}")
+        try:
+            size = int(result.stdout.split(None, 1)[0])
+        except (IndexError, ValueError):
+            fail(f"Could not parse source directory size: {relative_root}")
+        sizes.append((relative_root, size))
+
+    max_size = max((size for _, size in sizes), default=0)
+    print("\nSource directory sizes (largest first):")
+    for name, size in sorted(sizes, key=lambda item: item[1], reverse=True):
+        bar_size = round(30 * size / max_size) if max_size else 0
+        bar = "█" * bar_size
+        if size >= 1_000_000_000:
+            size_color = "31"
+        elif size > 250_000_000:
+            size_color = "38;5;208"
+        else:
+            size_color = "92"
+        size_text = color(f"{human_bytes(size):>10}", size_color)
+        print(f"  {size_text}  {bar:<30}  {name}")
 
 
 def run_batch(args):
-    base_text = input("Local NK directory [/run/media/namskash/PortableSSD/NK]: ").strip()
-    base = Path(base_text or "/run/media/namskash/PortableSSD/NK").expanduser().resolve()
-    if not base.is_dir():
-        fail("Local NK directory is unavailable.")
-    remote_root_id = os.environ.get("WORKDRIVE_NK_FOLDER_ID") or project_env_value("WORKDRIVE_NK_FOLDER_ID")
-    if not remote_root_id:
+    config = project_config()
+    apply_changes = args.apply if args.apply is not None else config.get("apply", True)
+    delete_remote = args.delete_remote if args.delete_remote is not None else config.get("deleteRemote", False)
+    if not isinstance(apply_changes, bool) or not isinstance(delete_remote, bool):
+        fail("Config values 'apply' and 'deleteRemote' must be true or false.")
+    dry_run = not apply_changes
+    base = local_backup_root(config)
+    source_roots = [
+        (relative_root, (base / relative_root).resolve())
+        for relative_root in load_backup_source_dirs()
+    ]
+    for relative_root, source in source_roots:
+        if not source.is_dir():
+            fail(f"A configured local source directory is missing; no changes made: {relative_root}")
+    print_source_sizes(source_roots)
+
+    remote_root_id = config.get("WORKDRIVE_FOLDER_ID")
+    if not isinstance(remote_root_id, str) or not remote_root_id.strip():
         remote_root_id = input("WorkDrive destination NK folder ID: ").strip()
     else:
-        print("Using the WorkDrive NK folder ID from project configuration.")
+        remote_root_id = remote_root_id.strip()
+        print(
+            f"\nUsing the {color('WorkDrive NK folder ID', '34')} from the "
+            f"{color('project configuration', '35')}."
+        )
     if not remote_root_id:
         fail("A WorkDrive destination folder ID is required.")
 
     token, api_root = get_access_token()
     started = time.monotonic()
-    print("Listing remote metadata and scanning local directory metadata...")
+    print("Listing remote metadata and scanning local directory metadata... this may take a while; please wait.\n")
     remote, remote_folders, api_requests = list_remote(api_root, token, remote_root_id)
 
     plans = []
@@ -341,10 +535,7 @@ def run_batch(args):
     total_baseline = 0
     manifest_data = None
 
-    for relative_root in BACKUP_SOURCE_DIRS:
-        source = (base / relative_root).resolve()
-        if not source.is_dir():
-            fail(f"A configured local source directory is missing; no changes made: {relative_root}")
+    for relative_root, source in source_roots:
         source_key = source_key_for(source)
         local, local_dirs, symlinks = scan_local(source)
         total_local_files += len(local)
@@ -364,7 +555,7 @@ def run_batch(args):
             for path, item in remote.items()
             if path.startswith(prefix + "/")
         }
-        if args.delete_remote:
+        if delete_remote:
             deletions, conflicts = tracked_deletion_candidates(previous, local, remote_for_source)
             deletion_candidates.extend(
                 {"remote_path": f"{relative_root}/{rel}", "remote_id": file_id}
@@ -374,15 +565,28 @@ def run_batch(args):
         candidates = []
         for rel, meta in local.items():
             remote_item = remote_for_source.get(rel)
-            if remote_item is None or remote_item["size"] != meta["size"]:
+            if remote_item is None:
                 candidates.append(rel)
                 continue
+            old = previous.get(rel) if previous is not None else None
+            if remote_item["size"] != meta["size"]:
+                previously_download_verified = (
+                    old is not None
+                    and old.get("download_verified") is True
+                    and old.get("remote_id") == remote_item.get("id")
+                    and old.get("size") == meta["size"]
+                    and old.get("mtime_ns") == meta["mtime_ns"]
+                )
+                if previously_download_verified:
+                    remote_item["size"] = meta["size"]
+                    remote_item["_download_verified"] = True
+                else:
+                    candidates.append(rel)
+                    continue
             if previous is None:
                 total_baseline += 1
-            else:
-                old = previous.get(rel)
-                if old is None or old.get("size") != meta["size"] or old.get("mtime_ns") != meta["mtime_ns"]:
-                    candidates.append(rel)
+            elif old is None or old.get("size") != meta["size"] or old.get("mtime_ns") != meta["mtime_ns"]:
+                candidates.append(rel)
 
         total_remote_only += sum(rel not in local for rel in remote_for_source)
         root_parts = relative_root.split("/")
@@ -415,6 +619,7 @@ def run_batch(args):
                 "local_path": local_path,
                 "target_parent": target_parent,
                 "size": local[rel]["size"],
+                "mtime_ns": local[rel]["mtime_ns"],
             })
         plans.append({
             "source_key": source_key,
@@ -424,12 +629,12 @@ def run_batch(args):
         })
 
     candidate_bytes = sum(item["size"] for item in all_candidates)
-    print("\nBatch plan:")
+    print(color("Batch plan:", "1;36"))
     print(f"  Source directories: {len(plans)}")
     print(f"  Local regular files: {total_local_files} ({human_bytes(total_local_bytes)})")
     print(f"  Candidate uploads: {len(all_candidates)} ({human_bytes(candidate_bytes)})")
     print(f"  Oversized candidate files skipped: {len(oversized_candidates)} ({human_bytes(sum(item[2] for item in oversized_candidates))})")
-    if args.delete_remote:
+    if delete_remote:
         print(f"  Manifest-tracked remote files to move to Trash: {len(deletion_candidates)}")
         for item in deletion_candidates:
             print(f"    Trash candidate: {item['remote_path']}")
@@ -448,23 +653,16 @@ def run_batch(args):
     print(f"  Symlinks skipped: {total_symlinks}")
     print(f"  API list requests: {api_requests}")
     print(f"  Preflight elapsed: {time.monotonic() - started:.2f}s")
-    print(f"  Manifest: {MANIFEST}")
+    print(f"  Manifest: {MANIFEST}\n")
 
     if invalid_folder_names:
         fail("Batch preflight found invalid folder names; no remote changes were made.")
-    if not args.apply:
-        print("DRY RUN: no folders, files, or manifest were changed.")
-        print("Use --all --apply only after reviewing this plan.")
+    if dry_run:
+        print(color("DRY RUN: no folders, files, or manifest were changed.", "33;1"))
+        print("Run again without --dry-run to upload and update the manifest.")
         return
 
-    confirmation = (
-        f"Type APPLY to create {len(missing_dirs)} folder(s), "
-        f"upload {len(all_candidates)} file(s), and update the manifest: "
-    )
-    if input(confirmation).strip() != "APPLY":
-        print("Cancelled; no changes made.")
-        return
-    if args.delete_remote and deletion_candidates:
+    if delete_remote and deletion_candidates:
         delete_confirmation = (
             f"Type DELETE to move these {len(deletion_candidates)} manifest-tracked file(s) to WorkDrive Trash: "
         )
@@ -476,14 +674,30 @@ def run_batch(args):
         create_missing_folders(api_root, token, remote_folders, missing_dirs)
     upload_started = time.monotonic()
     uploaded_bytes = 0
+    upload_summaries = {}
+    uploaded_files = []
     for index, item in enumerate(all_candidates, 1):
         parent_id = remote_folders.get(item["target_parent"])
         if not parent_id:
             fail("Destination parent folder is unavailable; stopping uploads.")
-        upload_file(api_root, token, parent_id, item["local_path"], item["local_path"].name)
+        response = upload_file(api_root, token, parent_id, item["local_path"], item["local_path"].name)
+        key = f"{item['relative_root']}/{item['relative_path']}"
+        upload_summaries[key] = upload_response_summary(response)
+        uploaded_files.append({
+            "path": key,
+            "modified_time": time.strftime(
+                "%Y-%m-%dT%H:%M:%S%z",
+                time.localtime(item["mtime_ns"] / 1_000_000_000),
+            ),
+            "size_bytes": item["size"],
+        })
         uploaded_bytes += item["size"]
-        print(f"Uploaded {index}/{len(all_candidates)} candidate file(s).")
+        print(color(f"Uploaded {index}/{len(all_candidates)} candidate file(s).", "32"))
 
+    print(
+        "\nNext: refreshing the full WorkDrive listing and verifying file sizes "
+        "before updating the manifest. This can take a few minutes; please wait."
+    )
     verified_remote, verified_folders, verify_requests = list_remote(api_root, token, remote_root_id)
     manifest_updates = []
     for plan in plans:
@@ -494,12 +708,66 @@ def run_batch(args):
             if path.startswith(prefix + "/")
         }
         skipped_paths = skipped_by_source.get(plan["source_key"], set())
+        missing_remote = []
+        size_mismatches = []
         for rel, meta in plan["local"].items():
             if rel in skipped_paths:
                 continue
             item = remote_for_source.get(rel)
-            if item is None or item["size"] != meta["size"]:
-                fail("Post-upload verification failed; manifest was not updated.")
+            if item is None:
+                missing_remote.append((rel, meta["size"], meta["mtime_ns"]))
+            elif item["size"] != meta["size"]:
+                key = f"{prefix}/{rel}"
+                print(
+                    f"Download verification attempt: {key}; local {meta['size']} B, "
+                    f"WorkDrive listed {item['size']} B, remote ID {item.get('id')}; "
+                    f"upload response {json.dumps(upload_summaries.get(key, {}), sort_keys=True)}"
+                )
+                downloaded_size = download_size_for_verification(
+                    api_root, token, item.get("id"), meta["size"]
+                )
+                if downloaded_size == meta["size"]:
+                    print(
+                        f"WorkDrive listed {item['size']} B for {rel}, but a streamed "
+                        f"download matched the local size ({downloaded_size} B); verified."
+                    )
+                    item["size"] = meta["size"]
+                    item["_download_verified"] = True
+                else:
+                    size_mismatches.append((rel, meta["size"], item["size"], downloaded_size))
+        if missing_remote or size_mismatches:
+            for rel, local_size, local_mtime in missing_remote:
+                key = f"{prefix}/{rel}"
+                print(
+                    f"  Verification details: {key}\n"
+                    f"    scanned local size: {local_size} B; scanned mtime_ns: {local_mtime}\n"
+                    f"    WorkDrive listing: file missing\n"
+                    f"    upload response metadata: {json.dumps(upload_summaries.get(key, {}), sort_keys=True)}",
+                    file=sys.stderr,
+                )
+            for rel, local_size, remote_size, downloaded_size in size_mismatches:
+                local_path = plan["source_root"] / rel
+                try:
+                    current = local_path.stat()
+                    current_size = current.st_size
+                    current_mtime = current.st_mtime_ns
+                except OSError:
+                    current_size = current_mtime = None
+                key = f"{prefix}/{rel}"
+                print(
+                    f"  Verification details: {key}\n"
+                    f"    scanned local size: {local_size} B; current local size: {current_size} B\n"
+                    f"    scanned mtime_ns: {plan['local'][rel]['mtime_ns']}; current mtime_ns: {current_mtime}\n"
+                    f"    WorkDrive listed size: {remote_size} B; streamed download size: {downloaded_size} B\n"
+                    f"    remote ID: {remote_for_source[rel].get('id')}\n"
+                    f"    upload response metadata: {json.dumps(upload_summaries.get(key, {}), sort_keys=True)}",
+                    file=sys.stderr,
+                )
+            fail(
+                "Post-upload verification failed; manifest was not updated "
+                f"({len(missing_remote)} remote file(s) missing, "
+                f"{len(size_mismatches)} size mismatch(es) after download verification)."
+            )
         nested_root_id = verified_folders.get(prefix)
         if not nested_root_id:
             fail("Post-upload folder verification failed; manifest was not updated.")
@@ -532,139 +800,28 @@ def run_batch(args):
             preserve_paths=skipped_paths,
         )
 
-    print(f"Batch upload and verification complete: {len(all_candidates)} file(s) uploaded.")
+    print(color(f"Batch upload and verification complete: {len(all_candidates)} file(s) uploaded.", "32;1"))
+    print("\nUploaded files (path, local modification time, size):")
+    for item in uploaded_files:
+        print(f"  {item['path']}\t{item['modified_time']}\t{item['size_bytes']} B")
     print_upload_stats(uploaded_bytes, time.monotonic() - upload_started)
     if deletion_candidates:
-        print(f"Moved {len(deletion_candidates)} tracked remote file(s) to Trash.")
-    print(f"Manifest written: {MANIFEST}")
-    print(f"Verification API requests: {verify_requests}")
+        print_stat_line("Moved tracked remote files to Trash", len(deletion_candidates))
+    print_stat_line("Manifest written", MANIFEST)
+    print_stat_line("Verification API requests", verify_requests)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--apply", action="store_true", help="upload candidates; default is dry-run")
-    parser.add_argument("--all", action="store_true", help="process the currently configured batch directories")
-    parser.add_argument("--delete-remote", action="store_true", help="in batch mode, move missing manifest-tracked files to Trash")
+    parser.add_argument("--apply", dest="apply", action="store_true", default=None, help="apply changes, overriding config.json")
+    parser.add_argument("--dry-run", dest="apply", action="store_false", help="preview changes, overriding config.json")
+    parser.add_argument("--delete-remote", dest="delete_remote", action="store_true", default=None, help="move missing manifest-tracked files to Trash, overriding config.json")
+    parser.add_argument("--no-delete-remote", dest="delete_remote", action="store_false", default=None, help="preserve remote-only files, overriding config.json")
     args = parser.parse_args()
-    if args.delete_remote and not args.all:
-        fail("--delete-remote currently requires --all batch mode.")
-    if args.all:
-        run_batch(args)
-        return
-
-    source_text = input("Local directory [~/NK/Docs]: ").strip() or "~/NK/Docs"
-    source = Path(source_text).expanduser().resolve()
-    if not source.is_dir():
-        fail("Local directory is unavailable.")
-    remote_id = input("WorkDrive destination folder ID: ").strip()
-    if not remote_id:
-        fail("A WorkDrive destination folder ID is required.")
-
-    source_key = source_key_for(source)
-    token, api_root = get_access_token()
-    started = time.monotonic()
-    print("Listing remote metadata and scanning local metadata...")
-    remote, remote_folders, api_requests = list_remote(api_root, token, remote_id)
-    local, local_dirs, symlinks = scan_local(source)
-    try:
-        manifest_data, previous = read_manifest(source_key)
-    except ValueError as exc:
-        fail(str(exc))
-
-    candidates = []
-    baseline_assumptions = 0
-    remote_only = sum(rel not in local for rel in remote)
-    for rel, meta in local.items():
-        remote_item = remote.get(rel)
-        if remote_item is None or remote_item["size"] != meta["size"]:
-            candidates.append(rel)
-            continue
-        if previous is None:
-            # Bootstrap assumption: a same-path, same-size remote file is present.
-            baseline_assumptions += 1
-        else:
-            old = previous.get(rel)
-            if old is None or old.get("size") != meta["size"] or old.get("mtime_ns") != meta["mtime_ns"]:
-                candidates.append(rel)
-
-    # Preflight candidates and the complete local directory tree before any remote writes.
-    candidate_info = []
-    oversized = 0
-    invalid_folder_names = 0
-    missing_parent_files = 0
-    for directory in local_dirs:
-        if len(directory.rsplit("/", 1)[-1]) > 200:
-            invalid_folder_names += 1
-    missing_dirs = local_dirs - set(remote_folders)
-
-    for rel in candidates:
-        local_path = source / rel
-        size = local[rel]["size"]
-        if size > MAX_NORMAL_UPLOAD:
-            oversized += 1
-            continue
-        parent_rel = rel.rpartition("/")[0]
-        if parent_rel and parent_rel not in remote_folders:
-            missing_parent_files += 1
-        candidate_info.append((rel, local_path, parent_rel))
-
-    print("\nCandidate upload plan:")
-    print(f"  Local regular files: {len(local)} ({human_bytes(sum(item['size'] for item in local.values()))})")
-    print(f"  Remote files: {len(remote)}")
-    print(f"  Candidate uploads: {len(candidates)} ({human_bytes(sum(local[rel]['size'] for rel in candidates))})")
-    print(f"  Missing destination folders to create: {len(missing_dirs)}")
-    print(f"  Candidate files with missing parent folders: {missing_parent_files}")
-    print(f"  Invalid folder names (>200 characters): {invalid_folder_names}")
-    print(f"  Candidates over 250 MB (not uploaded): {oversized}")
-    print(f"  Same-size remote files assumed present for initial baseline: {baseline_assumptions}")
-    print(f"  Remote-only files (never deleted): {remote_only}")
-    print(f"  Symlinks skipped: {symlinks}")
-    print(f"  API list requests: {api_requests}")
-    print(f"  Preflight elapsed: {time.monotonic() - started:.2f}s")
-    print(f"  Source key: {source_key}")
-    print(f"  Manifest: {MANIFEST}")
-
-    if invalid_folder_names or oversized:
-        fail("Preflight found unsupported items; no remote changes were made.")
-    if not args.apply:
-        print("DRY RUN: no folders, files, or manifest were changed.")
-        print("Use --apply only after reviewing this plan.")
-        return
-    confirmation = (
-        f"Type APPLY to create {len(missing_dirs)} folder(s), "
-        f"upload {len(candidate_info)} file(s), and update the manifest: "
-    )
-    if input(confirmation).strip() != "APPLY":
-        print("Cancelled; no changes made.")
-        return
-
-    if missing_dirs:
-        create_missing_folders(api_root, token, remote_folders, missing_dirs)
-
-    uploaded = 0
-    uploaded_bytes = 0
-    upload_started = time.monotonic()
-    for rel, local_path, parent_rel in candidate_info:
-        parent_id = remote_folders.get(parent_rel)
-        if not parent_id:
-            fail("Destination parent folder is unavailable; stopping uploads.")
-        upload_file(api_root, token, parent_id, local_path, local_path.name)
-        uploaded += 1
-        uploaded_bytes += local[rel]["size"]
-        print(f"Uploaded {uploaded}/{len(candidate_info)} candidate file(s).")
-
-    # Re-list to verify remote presence and size before recording local baselines.
-    verified_remote, _, verify_requests = list_remote(api_root, token, remote_id)
-    for rel in local:
-        item = verified_remote.get(rel)
-        if item is None or item["size"] != local[rel]["size"]:
-            fail("Post-upload verification failed; manifest was not updated.")
-
-    store_manifest(manifest_data, source_key, remote_id, local, verified_remote)
-    print(f"Upload and verification complete: {uploaded} file(s) uploaded.")
-    print_upload_stats(uploaded_bytes, time.monotonic() - upload_started)
-    print(f"Manifest written: {MANIFEST}")
-    print(f"Verification API requests: {verify_requests}")
+    log_path = setup_logging()
+    print_banner()
+    print(f"Log file: {log_path}")
+    run_batch(args)
 
 
 if __name__ == "__main__":

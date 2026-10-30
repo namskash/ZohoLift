@@ -61,6 +61,7 @@ def write_manifest(data, source_key, remote_folder_id, local_files, remote_files
             "mtime_ns": meta["mtime_ns"],
             "remote_id": remote_files[rel]["id"],
             "remote_size": remote_files[rel]["size"],
+            **({"download_verified": True} if remote_files[rel].get("_download_verified") else {}),
         }
         for rel, meta in local_files.items()
         if rel in remote_files and remote_files[rel]["size"] == meta["size"]

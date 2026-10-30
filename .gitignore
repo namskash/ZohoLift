@@ -1,4 +1,6 @@
-.env
+config.json
+backup-dirs.txt
 state/
+logs/
 __pycache__/
 *.py[cod]
