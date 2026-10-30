@@ -1,0 +1,17 @@
+# Lines starting with # will be ignored
+# Add sub-directories. One in each line.
+# Mention the relative path of the sub-directories from the base directory
+
+# Ex: If your base dir is My-Folder/
+#     And the dir has 3 sub-dirs: Documents/, Photos/, My Projects/
+#     Then, add them like so (without the # obviusly):
+
+# Documents
+# Photos
+# My Projects
+
+# NOTE: You can choose to not include ALL the child directories inside of a sub-dir too.
+# Ex: If Photos has 2 sub-dirs: Family/, Work/
+#     Then, just add one like so:
+
+# Photos/Family
