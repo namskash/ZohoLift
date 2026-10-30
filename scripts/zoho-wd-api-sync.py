@@ -48,6 +48,7 @@ class Tee:
 
 
 def setup_logging():
+    global RUN_LOG_PATH
     log_dir = Path(__file__).resolve().parents[1] / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -56,7 +57,26 @@ def setup_logging():
     logfile = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
     sys.stdout = Tee(sys.stdout, logfile)
     sys.stderr = Tee(sys.stderr, logfile)
+    RUN_LOG_PATH = log_path
     return log_path
+
+
+RUN_LOG_PATH = None
+
+
+def write_activity_report(uploaded_files, deleted_files):
+    if RUN_LOG_PATH is None:
+        return
+    report_path = RUN_LOG_PATH.with_suffix(".activity.json")
+    payload = {
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "uploaded": uploaded_files,
+        "moved_to_trash": deleted_files,
+    }
+    fd = os.open(report_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as report:
+        json.dump(payload, report, indent=2)
+        report.write("\n")
 
 
 def print_banner():
@@ -558,7 +578,15 @@ def run_batch(args):
         if delete_remote:
             deletions, conflicts = tracked_deletion_candidates(previous, local, remote_for_source)
             deletion_candidates.extend(
-                {"remote_path": f"{relative_root}/{rel}", "remote_id": file_id}
+                {
+                    "remote_path": f"{relative_root}/{rel}",
+                    "remote_id": file_id,
+                    "size_bytes": previous[rel].get("size"),
+                    "modified_time": time.strftime(
+                        "%Y-%m-%dT%H:%M:%S%z",
+                        time.localtime(previous[rel]["mtime_ns"] / 1_000_000_000),
+                    ) if isinstance(previous[rel].get("mtime_ns"), int) else None,
+                }
                 for rel, file_id in deletions
             )
             deletion_conflicts.extend(f"{relative_root}/{rel}" for rel in conflicts)
@@ -662,14 +690,6 @@ def run_batch(args):
         print("Run again without --dry-run to upload and update the manifest.")
         return
 
-    if delete_remote and deletion_candidates:
-        delete_confirmation = (
-            f"Type DELETE to move these {len(deletion_candidates)} manifest-tracked file(s) to WorkDrive Trash: "
-        )
-        if input(delete_confirmation).strip() != "DELETE":
-            print("Deletion cancelled; no remote files were deleted.")
-            return
-
     if missing_dirs:
         create_missing_folders(api_root, token, remote_folders, missing_dirs)
     upload_started = time.monotonic()
@@ -692,7 +712,10 @@ def run_batch(args):
             "size_bytes": item["size"],
         })
         uploaded_bytes += item["size"]
-        print(color(f"Uploaded {index}/{len(all_candidates)} candidate file(s).", "32"))
+        print(
+            f"{color(f'Uploaded {index}/{len(all_candidates)} candidate file(s).', '32')} "
+            f"{color(item['relative_path'], '90')}"
+        )
 
     print(
         "\nNext: refreshing the full WorkDrive listing and verifying file sizes "
@@ -783,7 +806,10 @@ def run_batch(args):
                 fail("A deletion target changed since preflight; no further deletions attempted.")
         for index, item in enumerate(deletion_candidates, 1):
             move_remote_file_to_trash(api_root, token, item["remote_id"])
-            print(f"Moved tracked remote file to Trash {index}/{len(deletion_candidates)}.")
+            print(
+                f"{color(f'Moved tracked remote file {index}/{len(deletion_candidates)} to Trash:', '31')} "
+                f"{color(item['remote_path'], '90')}\t{item['size_bytes']} B\t{item['modified_time']}"
+            )
         after_delete, _, delete_verify_requests = list_remote(api_root, token, remote_root_id)
         still_present = [item["remote_path"] for item in deletion_candidates if item["remote_path"] in after_delete]
         if still_present:
@@ -801,12 +827,15 @@ def run_batch(args):
         )
 
     print(color(f"Batch upload and verification complete: {len(all_candidates)} file(s) uploaded.", "32;1"))
-    print("\nUploaded files (path, local modification time, size):")
-    for item in uploaded_files:
-        print(f"  {item['path']}\t{item['modified_time']}\t{item['size_bytes']} B")
+    deleted_files = [
+        {key: item[key] for key in ("remote_path", "size_bytes", "modified_time")}
+        for item in deletion_candidates
+    ]
+    write_activity_report(uploaded_files, deleted_files)
+    print(f"Activity details: {RUN_LOG_PATH.with_suffix('.activity.json')}")
     print_upload_stats(uploaded_bytes, time.monotonic() - upload_started)
     if deletion_candidates:
-        print_stat_line("Moved tracked remote files to Trash", len(deletion_candidates))
+        print(color(f"Moved tracked remote files to Trash: {len(deletion_candidates)}", "31"))
     print_stat_line("Manifest written", MANIFEST)
     print_stat_line("Verification API requests", verify_requests)
 
