@@ -52,7 +52,7 @@ def setup_logging():
     log_dir = Path(__file__).resolve().parents[1] / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    log_path = log_dir / f"zoho-wd-api-sync-{stamp}-{os.getpid()}.log"
+    log_path = log_dir / f"{stamp}-{os.getpid()}_run.log"
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     logfile = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
     sys.stdout = Tee(sys.stdout, logfile)
@@ -257,15 +257,38 @@ def create_missing_folders(api_root, token, remote_folders, missing_dirs):
         print(f"Created destination folder {index}/{len(ordered)}.")
 
 
-def move_remote_file_to_trash(api_root, token, file_id):
-    response = api_patch_json(
-        api_root,
-        token,
+def move_remote_files_to_trash(api_root, token, items):
+    for start in range(0, len(items), 200):
+        batch = items[start:start + 200]
+        response = api_patch_json(
+            api_root,
+            token,
+            "/workdrive/api/v1/files",
+            {"data": [
+                {"id": str(item["remote_id"]), "type": "files",
+                 "attributes": {"status": "51"}}
+                for item in batch
+            ]},
+        )
+        if response.get("errors") or response.get("status") == "failure":
+            fail("WorkDrive reported a batch trash operation error.")
+
+
+def remote_file_metadata(api_root, token, file_id):
+    response = api_get(
+        api_root, token,
         f"/workdrive/api/v1/files/{quote(str(file_id), safe='')}",
-        {"data": {"attributes": {"status": "51"}, "type": "files"}},
     )
-    if response.get("errors") or response.get("status") == "failure":
-        fail("WorkDrive reported a trash operation error.")
+    data = response.get("data")
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict):
+        return None
+    attrs = data.get("attributes", {})
+    size = attrs.get("storage_info", {}).get("size_in_bytes")
+    if size is None:
+        size = attrs.get("size_in_bytes", attrs.get("size"))
+    return {"id": data.get("id"), "size": int(size) if size is not None else None}
 
 
 def tracked_deletion_candidates(previous, local_files, remote_files):
@@ -718,10 +741,46 @@ def run_batch(args):
         )
 
     print(
-        "\nNext: refreshing the full WorkDrive listing and verifying file sizes "
-        "before updating the manifest. This can take a few minutes; please wait."
+        "\nVerifying uploaded files using upload response metadata and targeted lookups only."
     )
-    verified_remote, verified_folders, verify_requests = list_remote(api_root, token, remote_root_id)
+    verified_remote = dict(remote)
+    verify_requests = 0
+    uploaded_by_path = {item["path"]: item for item in all_candidates}
+    for path, item in uploaded_by_path.items():
+        summary = upload_summaries[path]
+        remote_id = summary.get("id")
+        response_size = summary.get("size_in_bytes", summary.get("size"))
+        if response_size is None and isinstance(summary.get("storage_info"), dict):
+            response_size = summary["storage_info"].get("size_in_bytes")
+        if not remote_id:
+            fail(f"Upload response omitted a remote ID for {path}; manifest not updated.")
+        try:
+            remote_size = int(response_size) if response_size is not None else None
+        except (TypeError, ValueError):
+            remote_size = None
+        if remote_size is None:
+            remote_item = remote_file_metadata(api_root, token, remote_id)
+            verify_requests += 1
+            if not remote_item or remote_item.get("id") != remote_id:
+                fail(f"Could not verify uploaded file {path}; manifest not updated.")
+            remote_size = remote_item.get("size")
+        if remote_size is None:
+            fail(f"WorkDrive did not return a size for uploaded file {path}; manifest not updated.")
+        remote_item = {"id": remote_id, "size": remote_size}
+        if remote_size != item["size"]:
+            print(
+                f"Targeted size verification for {path}: local {item['size']} B, "
+                f"WorkDrive reported {remote_size} B."
+            )
+            downloaded_size = download_size_for_verification(
+                api_root, token, remote_id, item["size"]
+            )
+            if downloaded_size != item["size"]:
+                fail(f"Uploaded file size verification failed for {path}; manifest not updated.")
+            remote_item["size"] = item["size"]
+            remote_item["_download_verified"] = True
+        verified_remote[path] = remote_item
+
     manifest_updates = []
     for plan in plans:
         prefix = plan["relative_root"]
@@ -731,69 +790,9 @@ def run_batch(args):
             if path.startswith(prefix + "/")
         }
         skipped_paths = skipped_by_source.get(plan["source_key"], set())
-        missing_remote = []
-        size_mismatches = []
-        for rel, meta in plan["local"].items():
-            if rel in skipped_paths:
-                continue
-            item = remote_for_source.get(rel)
-            if item is None:
-                missing_remote.append((rel, meta["size"], meta["mtime_ns"]))
-            elif item["size"] != meta["size"]:
-                key = f"{prefix}/{rel}"
-                print(
-                    f"Download verification attempt: {key}; local {meta['size']} B, "
-                    f"WorkDrive listed {item['size']} B, remote ID {item.get('id')}; "
-                    f"upload response {json.dumps(upload_summaries.get(key, {}), sort_keys=True)}"
-                )
-                downloaded_size = download_size_for_verification(
-                    api_root, token, item.get("id"), meta["size"]
-                )
-                if downloaded_size == meta["size"]:
-                    print(
-                        f"WorkDrive listed {item['size']} B for {rel}, but a streamed "
-                        f"download matched the local size ({downloaded_size} B); verified."
-                    )
-                    item["size"] = meta["size"]
-                    item["_download_verified"] = True
-                else:
-                    size_mismatches.append((rel, meta["size"], item["size"], downloaded_size))
-        if missing_remote or size_mismatches:
-            for rel, local_size, local_mtime in missing_remote:
-                key = f"{prefix}/{rel}"
-                print(
-                    f"  Verification details: {key}\n"
-                    f"    scanned local size: {local_size} B; scanned mtime_ns: {local_mtime}\n"
-                    f"    WorkDrive listing: file missing\n"
-                    f"    upload response metadata: {json.dumps(upload_summaries.get(key, {}), sort_keys=True)}",
-                    file=sys.stderr,
-                )
-            for rel, local_size, remote_size, downloaded_size in size_mismatches:
-                local_path = plan["source_root"] / rel
-                try:
-                    current = local_path.stat()
-                    current_size = current.st_size
-                    current_mtime = current.st_mtime_ns
-                except OSError:
-                    current_size = current_mtime = None
-                key = f"{prefix}/{rel}"
-                print(
-                    f"  Verification details: {key}\n"
-                    f"    scanned local size: {local_size} B; current local size: {current_size} B\n"
-                    f"    scanned mtime_ns: {plan['local'][rel]['mtime_ns']}; current mtime_ns: {current_mtime}\n"
-                    f"    WorkDrive listed size: {remote_size} B; streamed download size: {downloaded_size} B\n"
-                    f"    remote ID: {remote_for_source[rel].get('id')}\n"
-                    f"    upload response metadata: {json.dumps(upload_summaries.get(key, {}), sort_keys=True)}",
-                    file=sys.stderr,
-                )
-            fail(
-                "Post-upload verification failed; manifest was not updated "
-                f"({len(missing_remote)} remote file(s) missing, "
-                f"{len(size_mismatches)} size mismatch(es) after download verification)."
-            )
-        nested_root_id = verified_folders.get(prefix)
+        nested_root_id = remote_folders.get(prefix)
         if not nested_root_id:
-            fail("Post-upload folder verification failed; manifest was not updated.")
+            fail("Destination folder ID unavailable; manifest was not updated.")
         manifest_local = {
             rel: meta for rel, meta in plan["local"].items() if rel not in skipped_paths
         }
@@ -801,20 +800,17 @@ def run_batch(args):
 
     if deletion_candidates:
         for item in deletion_candidates:
-            current = verified_remote.get(item["remote_path"])
+            current = remote.get(item["remote_path"])
             if not current or current.get("id") != item["remote_id"]:
                 fail("A deletion target changed since preflight; no further deletions attempted.")
+        move_remote_files_to_trash(api_root, token, deletion_candidates)
         for index, item in enumerate(deletion_candidates, 1):
-            move_remote_file_to_trash(api_root, token, item["remote_id"])
+            if index == 1:
+                print()
             print(
                 f"{color(f'Moved tracked remote file {index}/{len(deletion_candidates)} to Trash:', '31')} "
-                f"{color(item['remote_path'], '90')}\t{item['size_bytes']} B\t{item['modified_time']}"
+                f"{color(item['remote_path'], '90')}"
             )
-        after_delete, _, delete_verify_requests = list_remote(api_root, token, remote_root_id)
-        still_present = [item["remote_path"] for item in deletion_candidates if item["remote_path"] in after_delete]
-        if still_present:
-            fail("Trash verification failed; manifest was not updated.")
-        verify_requests += delete_verify_requests
 
     for plan, nested_root_id, manifest_local, remote_for_source, skipped_paths in manifest_updates:
         store_manifest(
@@ -832,7 +828,7 @@ def run_batch(args):
         for item in deletion_candidates
     ]
     write_activity_report(uploaded_files, deleted_files)
-    print(f"Activity details: {RUN_LOG_PATH.with_suffix('.activity.json')}")
+    print(color(f"Activity details: {RUN_LOG_PATH.with_suffix('.activity.json').relative_to(PROJECT_DIR)}", "90"))
     print_upload_stats(uploaded_bytes, time.monotonic() - upload_started)
     if deletion_candidates:
         print(color(f"Moved tracked remote files to Trash: {len(deletion_candidates)}", "31"))
@@ -849,7 +845,8 @@ def main():
     args = parser.parse_args()
     log_path = setup_logging()
     print_banner()
-    print(f"Log file: {log_path}")
+    print()
+    print(color(f"Log file: {log_path.relative_to(PROJECT_DIR)}", "90"))
     run_batch(args)
 
 
