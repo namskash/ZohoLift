@@ -254,7 +254,12 @@ def create_missing_folders(api_root, token, remote_folders, missing_dirs):
         if not parent_id:
             fail("A parent folder is still missing; stopping before file uploads.")
         remote_folders[rel] = create_remote_folder(api_root, token, parent_id, name)
-        print(f"Created destination folder {index}/{len(ordered)}.")
+        print(
+            f"Created destination folder {index}/{len(ordered)}: "
+            f"{color(name, '90')}"
+        )
+    if ordered:
+        print()
 
 
 def move_remote_files_to_trash(api_root, token, items):
@@ -751,7 +756,7 @@ def run_batch(args):
         })
         uploaded_bytes += item["size"]
         print(
-            f"{color(f'Uploaded {index}/{len(all_candidates)} candidate file(s).', '32')} "
+            f"{color(f'Uploaded {index}/{len(all_candidates)} candidate file(s):', '32')} "
             f"{color(item['relative_path'], '90')}"
         )
 
