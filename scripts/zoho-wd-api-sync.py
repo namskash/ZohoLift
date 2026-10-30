@@ -312,9 +312,11 @@ def print_stat_line(label, value):
     print(f"  {color(label + ':', '35')} {color(str(value), '37')}")
 
 
-def print_upload_stats(uploaded_bytes, elapsed):
+def print_upload_stats(uploaded_bytes, elapsed, total_elapsed):
     speed = uploaded_bytes / elapsed if elapsed > 0 else 0
-    print_stat_line("Upload time", f"{elapsed:.2f}s")
+    elapsed_color = "92" if elapsed < 50 else "38;5;208" if elapsed < 150 else "31"
+    print(f"  {color('Upload time:', '35')} {color(f'{elapsed:.2f}s', elapsed_color)}")
+    print_stat_line("Preflight + upload time", f"{total_elapsed:.2f}s")
     print_stat_line("Upload throughput", f"{human_bytes(speed)}/s")
 
 
@@ -681,30 +683,43 @@ def run_batch(args):
 
     candidate_bytes = sum(item["size"] for item in all_candidates)
     print(color("Batch plan:", "1;36"))
-    print(f"  Source directories: {len(plans)}")
-    print(f"  Local regular files: {total_local_files} ({human_bytes(total_local_bytes)})")
-    print(f"  Candidate uploads: {len(all_candidates)} ({human_bytes(candidate_bytes)})")
-    print(f"  Oversized candidate files skipped: {len(oversized_candidates)} ({human_bytes(sum(item[2] for item in oversized_candidates))})")
+
+    def plan_line(label, value, value_color="37"):
+        print(f"  {color(label + ':', '94')} {color(str(value), value_color)}")
+
+    plan_line("Source directories", len(plans))
+    plan_line("Local regular files", f"{total_local_files} ({human_bytes(total_local_bytes)})")
+    plan_line("Candidate uploads", f"{len(all_candidates)} ({human_bytes(candidate_bytes)})")
     if delete_remote:
-        print(f"  Manifest-tracked remote files to move to Trash: {len(deletion_candidates)}")
+        plan_line(
+            "Manifest-tracked remote files to move to Trash",
+            len(deletion_candidates), "31" if deletion_candidates else "37",
+        )
         for item in deletion_candidates:
-            print(f"    Trash candidate: {item['remote_path']}")
-        print(f"  Remote ID/path conflicts protected from deletion: {len(deletion_conflicts)}")
+            print(f"    {color('Trash candidate:', '94')} {color(item['remote_path'], '37')}")
+        plan_line("Remote ID/path conflicts protected from deletion", len(deletion_conflicts))
         for path in deletion_conflicts:
-            print(f"    Protected conflict: {path}")
-    print(f"  Missing destination folders to create: {len(missing_dirs)}")
-    print(f"  Invalid folder names (>200 characters): {invalid_folder_names}")
-    print(f"  Candidates over 250 MB: {len(oversized_candidates)} ({human_bytes(sum(item[2] for item in oversized_candidates))})")
-    print(f"    250 MB–1 GB: {sum(MAX_NORMAL_UPLOAD < item[2] <= 1_000_000_000 for item in oversized_candidates)}")
-    print(f"    Over 1 GB: {sum(item[2] > 1_000_000_000 for item in oversized_candidates)}")
+            print(f"    {color('Protected conflict:', '94')} {color(path, '37')}")
+    plan_line("Missing destination folders to create", len(missing_dirs), "32" if missing_dirs else "37")
+    plan_line("Invalid folder names (>200 characters)", invalid_folder_names, "31" if invalid_folder_names else "37")
+    plan_line(
+        "Candidates over 250 MB", len(oversized_candidates),
+        "31" if oversized_candidates else "37",
+    )
     for relative_root, rel, size in oversized_candidates:
-        print(f"    Oversized: {relative_root}/{rel} ({human_bytes(size)})")
-    print(f"  Same-size remote files assumed present: {total_baseline}")
-    print(f"  Remote-only files found (tracked deletions listed separately): {total_remote_only}")
-    print(f"  Symlinks skipped: {total_symlinks}")
-    print(f"  API list requests: {api_requests}")
-    print(f"  Preflight elapsed: {time.monotonic() - started:.2f}s")
-    print(f"  Manifest: {MANIFEST}\n")
+        print(f"    {color(f'{relative_root}/{rel} ({human_bytes(size)})', '90')}")
+    if oversized_candidates:
+        print(f"    {color('These will be skipped by this sync.', '90')}")
+    plan_line("Same-size remote files assumed present", total_baseline)
+    plan_line("Remote-only files found (tracked deletions listed separately)", total_remote_only)
+    plan_line("Symlinks skipped", total_symlinks, "31" if total_symlinks else "37")
+    api_color = "92" if api_requests < 20 else "38;5;208" if api_requests < 50 else "31"
+    plan_line("API list requests", api_requests, api_color)
+    preflight_elapsed = time.monotonic() - started
+    elapsed_color = "92" if preflight_elapsed < 120 else "38;5;208" if preflight_elapsed < 240 else "31"
+    plan_line("Preflight elapsed", f"{preflight_elapsed:.2f}s", elapsed_color)
+    plan_line("Manifest", MANIFEST, "35")
+    print()
 
     if invalid_folder_names:
         fail("Batch preflight found invalid folder names; no remote changes were made.")
@@ -740,8 +755,10 @@ def run_batch(args):
             f"{color(item['relative_path'], '90')}"
         )
 
+    if all_candidates:
+        print()
     print(
-        "\nVerifying uploaded files using upload response metadata and targeted lookups only."
+        "Verifying uploaded files using upload response metadata and targeted lookups only.\n"
     )
     verified_remote = dict(remote)
     verify_requests = 0
@@ -829,7 +846,8 @@ def run_batch(args):
     ]
     write_activity_report(uploaded_files, deleted_files)
     print(color(f"Activity details: {RUN_LOG_PATH.with_suffix('.activity.json').relative_to(PROJECT_DIR)}", "90"))
-    print_upload_stats(uploaded_bytes, time.monotonic() - upload_started)
+    upload_elapsed = time.monotonic() - upload_started
+    print_upload_stats(uploaded_bytes, upload_elapsed, preflight_elapsed + upload_elapsed)
     if deletion_candidates:
         print(color(f"Moved tracked remote files to Trash: {len(deletion_candidates)}", "31"))
     print_stat_line("Manifest written", MANIFEST)
