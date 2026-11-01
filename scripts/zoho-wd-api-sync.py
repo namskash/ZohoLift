@@ -105,13 +105,25 @@ def human_bytes(value):
         size /= 1024
 
 
-def http_json(request):
+class RateLimitError(Exception):
+    def __init__(self, retry_after=None):
+        self.retry_after = retry_after
+
+
+def http_json(request, retry_429=False):
     try:
         with urlopen(request, timeout=90) as response:
             body = response.read()
             return json.loads(body) if body else {}
     except HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
+        if retry_429 and exc.code == 429:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                retry_after = float(retry_after) if retry_after is not None else None
+            except ValueError:
+                retry_after = None
+            raise RateLimitError(retry_after) from exc
         fail(f"HTTP {exc.code}: {body[:1000]}")
     except URLError as exc:
         fail(f"Network/API request failed: {exc.reason}")
@@ -126,7 +138,15 @@ def api_get(api_root, token, path, params=None):
             "Accept": "application/vnd.api+json",
         },
     )
-    return http_json(request)
+    for attempt in range(4):
+        try:
+            return http_json(request, retry_429=True)
+        except RateLimitError as exc:
+            if attempt == 3:
+                fail("WorkDrive rate limit persisted after retries; wait before rerunning.")
+            delay = max(5 * (2 ** attempt), exc.retry_after or 0)
+            print(f"WorkDrive rate limit (F7008/HTTP 429); retrying this read in {delay:g}s.")
+            time.sleep(delay)
 
 
 def api_post_json(api_root, token, path, payload):
@@ -434,8 +454,10 @@ def upload_response_summary(response):
             summary[key] = attrs[key]
     if response.get("status") is not None:
         summary["api_status"] = response["status"]
-    if isinstance(data, dict) and data.get("id") is not None:
-        summary["id"] = data["id"]
+    if isinstance(data, dict):
+        remote_id = data.get("id") or attrs.get("resource_id") or attrs.get("id")
+        if remote_id is not None:
+            summary["id"] = remote_id
     return summary
 
 
