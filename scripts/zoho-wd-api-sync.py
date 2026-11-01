@@ -290,10 +290,47 @@ def remote_file_metadata(api_root, token, file_id):
     if not isinstance(data, dict):
         return None
     attrs = data.get("attributes", {})
-    size = attrs.get("storage_info", {}).get("size_in_bytes")
+    storage = attrs.get("storage_info") or {}
+    size = storage.get("size_in_bytes")
     if size is None:
         size = attrs.get("size_in_bytes", attrs.get("size"))
     return {"id": data.get("id"), "size": int(size) if size is not None else None}
+
+
+def find_remote_file_in_folder(api_root, token, parent_id, filename, expected_size):
+    matches = []
+    offset = 0
+    requests = 0
+    while True:
+        result = api_get(
+            api_root, token,
+            f"/workdrive/api/v1/files/{quote(str(parent_id), safe='')}/files",
+            {"page[limit]": PAGE_SIZE, "page[offset]": offset},
+        )
+        requests += 1
+        items = result.get("data", [])
+        for item in items:
+            attrs = item.get("attributes", {})
+            if attrs.get("name") != filename or attrs.get("is_folder") is True:
+                continue
+            storage = attrs.get("storage_info") or {}
+            size = storage.get("size_in_bytes")
+            if size is None:
+                size = attrs.get("size_in_bytes", attrs.get("size"))
+            matches.append({
+                "id": item.get("id"),
+                "size": int(size) if size is not None else None,
+            })
+        if len(items) < PAGE_SIZE:
+            break
+        offset += len(items)
+
+    exact_matches = [item for item in matches if item["size"] == expected_size]
+    if len(exact_matches) == 1:
+        return exact_matches[0], requests
+    if not exact_matches and len(matches) == 1:
+        return matches[0], requests
+    return None, requests
 
 
 def tracked_deletion_candidates(previous, local_files, remote_files):
@@ -700,8 +737,6 @@ def run_batch(args):
             "Manifest-tracked remote files to move to Trash",
             len(deletion_candidates), "31" if deletion_candidates else "37",
         )
-        for item in deletion_candidates:
-            print(f"    {color('Trash candidate:', '94')} {color(item['remote_path'], '37')}")
         plan_line("Remote ID/path conflicts protected from deletion", len(deletion_conflicts))
         for path in deletion_conflicts:
             print(f"    {color('Protected conflict:', '94')} {color(path, '37')}")
@@ -767,7 +802,10 @@ def run_batch(args):
     )
     verified_remote = dict(remote)
     verify_requests = 0
-    uploaded_by_path = {item["path"]: item for item in all_candidates}
+    uploaded_by_path = {
+        f"{item['relative_root']}/{item['relative_path']}": item
+        for item in all_candidates
+    }
     for path, item in uploaded_by_path.items():
         summary = upload_summaries[path]
         remote_id = summary.get("id")
@@ -775,7 +813,18 @@ def run_batch(args):
         if response_size is None and isinstance(summary.get("storage_info"), dict):
             response_size = summary["storage_info"].get("size_in_bytes")
         if not remote_id:
-            fail(f"Upload response omitted a remote ID for {path}; manifest not updated.")
+            parent_id = remote_folders.get(item["target_parent"])
+            if not parent_id:
+                fail(f"Upload response omitted a remote ID for {path}; manifest not updated.")
+            remote_item, lookup_requests = find_remote_file_in_folder(
+                api_root, token, parent_id, item["local_path"].name, item["size"]
+            )
+            verify_requests += lookup_requests
+            if not remote_item or not remote_item.get("id"):
+                fail(f"Could not uniquely find uploaded file {path} in its destination folder; manifest not updated.")
+            remote_id = remote_item["id"]
+            if response_size is None:
+                response_size = remote_item.get("size")
         try:
             remote_size = int(response_size) if response_size is not None else None
         except (TypeError, ValueError):
