@@ -6,6 +6,7 @@ This project backs up directories from an external SSD to Zoho WorkDrive through
 
 - Never inspect, read, or scan the configured source data directories from the agent, including during debugging. Do not run backup commands on the user's behalf.
 - Never expose or record OAuth secrets, grant codes, access tokens, or refresh tokens. Keep OAuth credentials outside this project.
+- Keep tracked documentation and examples safe for a public repository: do not include user-specific source paths/names, local roots, destination folder IDs, account identifiers, upload/run history, or private operational details. Refer to private ignored configuration generically instead.
 - Never use Git commands unless the user explicitly asks.
 
 ## Project layout and behavior
