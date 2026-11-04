@@ -48,7 +48,7 @@ class Tee:
 
 
 def setup_logging():
-    global RUN_LOG_PATH
+    global RUN_LOG_PATH, RUN_LOG_FILE
     log_dir = Path(__file__).resolve().parents[1] / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -58,10 +58,21 @@ def setup_logging():
     sys.stdout = Tee(sys.stdout, logfile)
     sys.stderr = Tee(sys.stderr, logfile)
     RUN_LOG_PATH = log_path
+    RUN_LOG_FILE = logfile
+    log_event("run_started", python=sys.version.split()[0], platform=sys.platform)
     return log_path
 
 
 RUN_LOG_PATH = None
+RUN_LOG_FILE = None
+
+
+def log_event(event, **details):
+    if RUN_LOG_FILE is None:
+        return
+    safe_details = json.dumps(details, sort_keys=True, default=str)
+    RUN_LOG_FILE.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {event} {safe_details}\n")
+    RUN_LOG_FILE.flush()
 
 
 def write_activity_report(uploaded_files, deleted_files):
@@ -93,6 +104,7 @@ def color(text, code):
 
 
 def fail(message):
+    log_event("fatal_error", message=message)
     print(color(f"ERROR: {message}", "31;1"), file=sys.stderr)
     raise SystemExit(1)
 
@@ -125,8 +137,8 @@ def http_json(request, retry_429=False):
                 retry_after = None
             raise RateLimitError(retry_after) from exc
         fail(f"HTTP {exc.code}: {body[:1000]}")
-    except URLError as exc:
-        fail(f"Network/API request failed: {exc.reason}")
+    except URLError:
+        raise
 
 
 def api_get(api_root, token, path, params=None):
@@ -139,13 +151,39 @@ def api_get(api_root, token, path, params=None):
         },
     )
     for attempt in range(4):
+        started = time.monotonic()
+        log_event("api_request_started", method="GET", endpoint=path, attempt=attempt + 1)
         try:
-            return http_json(request, retry_429=True)
+            result = http_json(request, retry_429=True)
+            log_event(
+                "api_request_succeeded", method="GET", endpoint=path,
+                attempt=attempt + 1, elapsed_seconds=round(time.monotonic() - started, 3),
+            )
+            return result
         except RateLimitError as exc:
+            log_event(
+                "api_request_rate_limited", method="GET", endpoint=path,
+                attempt=attempt + 1, elapsed_seconds=round(time.monotonic() - started, 3),
+                retry_after=exc.retry_after,
+            )
             if attempt == 3:
                 fail("WorkDrive rate limit persisted after retries; wait before rerunning.")
             delay = max(5 * (2 ** attempt), exc.retry_after or 0)
             print(f"WorkDrive rate limit (F7008/HTTP 429); retrying this read in {delay:g}s.")
+            time.sleep(delay)
+        except URLError as exc:
+            reason = exc.reason
+            log_event(
+                "api_request_network_error", method="GET", endpoint=path,
+                attempt=attempt + 1, elapsed_seconds=round(time.monotonic() - started, 3),
+                reason=str(reason),
+            )
+            if not isinstance(reason, TimeoutError):
+                fail(f"Network/API request failed: {reason}")
+            if attempt == 3:
+                fail(f"Network/API request timed out after retries: {reason}")
+            delay = 2 ** attempt
+            print(f"WorkDrive API request timed out; retrying this read in {delay}s ({attempt + 1}/4).")
             time.sleep(delay)
 
 
@@ -211,7 +249,14 @@ def list_remote(api_root, token, root_id):
                 break
             offset += len(items)
 
+    list_started = time.monotonic()
+    log_event("remote_listing_started", page_size=PAGE_SIZE)
     visit(root_id, "")
+    log_event(
+        "remote_listing_completed", api_requests=request_count,
+        files=len(files), folders=len(folders),
+        elapsed_seconds=round(time.monotonic() - list_started, 3),
+    )
     return files, folders, request_count
 
 
@@ -624,7 +669,9 @@ def run_batch(args):
     if not remote_root_id:
         fail("A WorkDrive destination folder ID is required.")
 
+    log_event("oauth_refresh_started")
     token, api_root = get_access_token()
+    log_event("oauth_refresh_succeeded", api_domain=urlsplit(api_root).hostname)
     started = time.monotonic()
     print("Listing remote metadata and scanning local directory metadata... this may take a while; please wait.\n")
     remote, remote_folders, api_requests = list_remote(api_root, token, remote_root_id)
