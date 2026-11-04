@@ -6,14 +6,11 @@
 
 ## Options
 
-### 1. Bounded concurrency — best first optimisation
+### 1. Bounded concurrency — abandoned
 
-Folder listings become independent as soon as their IDs are discovered. The current recursive implementation waits for a child folder’s full listing before moving to the next sibling. A bounded worker pool could list multiple sibling folders concurrently, reducing serial network latency.
+An implementation that listed sibling folders concurrently with a maximum of three workers was tried and then abandoned: concurrency of three triggered Zoho rate limiting. Concurrent listing does not reduce request count, and the rate-limit cost outweighs the latency benefit. Do not use or recommend this approach without new evidence that the API limits or request pacing have changed.
 
-- Keep pagination for each folder and preserve the same path-to-ID/file metadata results.
-- Bound concurrency and handle throttling/retries; do not issue unbounded requests.
-- Measure request counts and elapsed time before and after.
-- The first remote listing remains necessary for planning and remote-only/deletion checks.
+The safe baseline is sequential folder traversal with bounded backoff for retryable HTTP/network errors. Any future optimization should first be tested with conservative request pacing and observed rate-limit behavior. The initial remote listing remains necessary for planning and remote-only/deletion checks.
 
 ### 2. Recent Changes API — promising, but needs validation
 
@@ -39,4 +36,4 @@ The documented list-folder endpoint returns at most 50 results per page. Follow 
 
 ## Recommendation
 
-Implement and benchmark bounded concurrency first: it is a contained change that preserves the current full-inventory semantics. Separately prototype the Changes API against a nested test tree before designing persistent incremental inventory. Do not replace full traversal with a cache until change coverage and recovery behavior are confirmed.
+Do not pursue the three-worker concurrency approach; it caused rate limiting. Prefer sequential traversal with retry/backoff unless a rate-limit-safe alternative is demonstrated. The Changes API remains a possible way to reduce repeated full traversals, but should be prototyped against a nested test tree before designing persistent incremental inventory. Do not replace full traversal with a cache until change coverage and recovery behavior are confirmed.
